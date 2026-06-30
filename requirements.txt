@@ -1,3 +1,15 @@
+# Base. For the edge-aware (guided-filter) window-pull feather, use the contrib
+# build INSTEAD of opencv-python: `pip install opencv-contrib-python` (do not install
+# both — they conflict). Without ximgproc the feather falls back to a Gaussian blur.
 opencv-python>=4.6
+# opencv-contrib-python>=4.6   # <- use this instead of opencv-python for cv2.ximgproc
 numpy>=1.21
 flask>=2.0
+
+# SegFormer semantic masks for the precise glass-only window mask + finishing
+# refinements. OPTIONAL: if these are not installed, window_mask.get_label_masks()
+# returns None and the pipeline falls back automatically — the finishing window mask
+# becomes a luminance clipping ramp and the window pull uses a clipping-only glass
+# mask (less precise on scenes with bright white appliances).
+torch>=1.13
+transformers>=4.25

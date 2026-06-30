@@ -44,6 +44,9 @@ followed by the calibrated &ldquo;white HDR&rdquo; finishing chain &mdash; pure 
   <div class="opt">
     <label><input type="checkbox" name="enhance" checked> HDR enhance (calibrated color/tone finishing)</label>
   </div>
+  <div class="opt">
+    <label><input type="checkbox" name="pull" checked> Window pull (recover the blown-out window view)</label>
+  </div>
   <p><button type="submit">Process</button></p>
 </form>
 {% if result %}
@@ -78,7 +81,8 @@ def index():
     except ValueError:
         mw = 3000
     t0 = time.time()
-    res = process_brackets(imgs, enhance=("enhance" in request.form), max_width=mw)
+    res = process_brackets(imgs, enhance=("enhance" in request.form),
+                           max_width=mw, pull_windows=("pull" in request.form))
     name = f"hdr_{int(time.time() * 1000)}.jpg"
     cv2.imwrite(os.path.join(RESULTS, name), res, [cv2.IMWRITE_JPEG_QUALITY, 95])
     return render_template_string(PAGE, result=name, took=round(time.time() - t0, 1))
