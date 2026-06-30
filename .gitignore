@@ -1,0 +1,17 @@
+# results / outputs
+results/
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os
+Thumbs.db
+.DS_Store
