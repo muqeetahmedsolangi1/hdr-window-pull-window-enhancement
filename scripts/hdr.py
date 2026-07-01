@@ -151,17 +151,18 @@ def light_through_mask(seg_win, darkest, min_p75=0.20, min_area_frac=0.0004):
         comp = lab == i
         score = float(np.percentile(darkest[comp], 75))
         peak = float(np.percentile(darkest[comp], 90))
-        # REFLECTION / GLINT reject: a real window shows the OUTDOORS (the
-        # brightest thing in the scene) so in the darkest bracket it has a bright,
-        # often clipped PEAK (p90 ~0.9-1.0). A reflection in a shiny appliance is
-        # dim second-hand light and small — no bright peak. Drop small + no-peak.
+        if score > best_score:            # remember the brightest candidate
+            best_score, best_comp = score, comp
+        # REFLECTION / GLINT reject: a SMALL blob with no bright peak in the darkest
+        # bracket is second-hand light (a window mirrored in a shiny appliance), not a
+        # window. Drop only small + no-peak — never a large region.
         if area_frac < 0.012 and peak < 0.80:
             reflections += 1
             dropped += 1
             continue
-        if score > best_score:            # remember the brightest candidate
-            best_score, best_comp = score, comp
-        if score >= min_p75:
+        # KEEP a LARGE region (a real window — even one facing shade that is dim in the
+        # darkest bracket), OR a small one with a bright sky peak, OR any bright enough.
+        if area_frac >= 0.012 or peak >= 0.80 or score >= min_p75:
             out[comp] = seg_win[comp]
             kept += 1
         else:
@@ -682,7 +683,14 @@ def process_brackets(images, enhance=True, max_width=4000, pull_windows=False,
         if 1e-3 < med < 0.58:                          # gentle lift, keep contrast
             view = np.clip(raw, 0, 1) ** float(np.clip(
                 np.log(0.58) / np.log(med), 0.6, 1.0))
-        gm = _feather_edge(np.clip(seg_win, 0, 1).astype(np.float32) * litw, fused)[..., None]
+        # FULL-opacity crisp view across the whole detected window (binary + holes
+        # filled) so a soft/weak SegFormer mask can't leave the glass half-composited
+        # (that half-mix with the washed fusion = the pale/washed water). `litw` still
+        # gates it so the dark FRAME/mullions keep the bright fused pixels.
+        win = (np.clip(seg_win, 0, 1) > 0.25).astype(np.float32)
+        kf = max(3, int(w * 0.006)) | 1
+        win = cv2.morphologyEx(win, cv2.MORPH_CLOSE, np.ones((kf, kf), np.uint8))
+        gm = _feather_edge(win * litw, fused)[..., None]
         fused = fused * (1 - gm) + view * gm           # crisp view into the glass only
         wm = _window_protect_mask(seg_win, w)[..., None]
         img = img * (1 - wm) + fused * wm
