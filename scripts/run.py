@@ -18,15 +18,17 @@ from hdr import load_exposures, process_brackets
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: python run.py <exposures_folder> [output.jpg] [max_width] [no-enhance] [no-pull]\n"
+        print("usage: python run.py <exposures_folder> [output.jpg] [max_width] [no-enhance] [pull]\n"
               "  no-enhance = plain Mertens fusion + sharpen only (no finishing chain)\n"
-              "  no-pull    = skip the window pull (leave blown windows as-is)")
+              "  pull       = opt into the experimental darker-bracket window pull\n"
+              "               (default: OFF — the indoor is enhanced and the window keeps\n"
+              "                its natural fused view, no washout/halos)")
         return
     folder = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 else "hdr_result.jpg"
     max_width = int(sys.argv[3]) if len(sys.argv) > 3 else 4000
     enhance = "no-enhance" not in sys.argv[1:]
-    pull = "no-pull" not in sys.argv[1:]
+    pull = "pull" in sys.argv[1:]
 
     imgs = load_exposures(folder)
     print(f"loaded {len(imgs)} exposures from {folder}  (enhance={enhance}, pull_windows={pull})")
