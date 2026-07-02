@@ -44,6 +44,7 @@ import cv2
 import numpy as np
 
 import window_mask   # SegFormer semantic masks; returns None if torch/transformers absent
+import sam_refine    # MobileSAM boundary refinement; falls back to SegFormer if absent
 
 
 # ---------------------------------------------------------------- IO
@@ -122,6 +123,29 @@ def build_window_mask(mid, seg_mask=None):
         ramp = ramp * (0.35 + 0.65 * seg_mask)
     k = max(31, int(mid_gray.shape[1] * 0.008) | 1)
     return cv2.GaussianBlur(ramp, (k, k), 0)
+
+
+def _keep_glass_doors(door_mask, darkest_bgr, min_peak=0.5, min_area_frac=0.0008):
+    """From the ADE 'door' class, keep only GLASS doors and drop SOLID doors.
+
+    SegFormer labels BOTH sliding-glass patio doors AND ordinary closet / panel doors as
+    class 'door' (14). A glass door is a window (exterior view behind it); a solid door is
+    not, and if it slips into the window mask the pull haloes it (grey closet doors framed
+    in white). A glass door shows the bright outdoors, so in the exterior-metered darkest
+    bracket its brightest pixels are high (p99 >= ~0.5); a solid door is uniformly dark
+    (p99 ~0.1-0.25, measured). Keep a door component only if it has that bright peak.
+    """
+    dark = cv2.cvtColor(darkest_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    h, w = dark.shape
+    n, lab, st, _ = cv2.connectedComponentsWithStats((door_mask > 0.5).astype(np.uint8))
+    out = np.zeros_like(door_mask, np.float32)
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] < min_area_frac * h * w:
+            continue
+        comp = lab == i
+        if float(np.percentile(dark[comp], 99)) >= min_peak:
+            out[comp] = 1.0
+    return out
 
 
 def light_through_mask(seg_win, darkest, min_p75=0.20, min_area_frac=0.0004):
@@ -216,14 +240,16 @@ def _window_band(seg_win, w):
 
 
 def _window_protect_mask(seg_win, w):
-    """Soft mask over the whole window UNIT (glass + frame/mullions/sash + a small
-    margin). Used to KEEP the window's natural Mertens-fused view: the indoor
-    finishing/enhance chain blows the window out and haloes it, so we restore the
-    window from the raw fused image through this mask and enhance the indoor only.
-    Dilated to cover the frame, then feathered for a seamless join with the wall."""
-    k = max(3, int(w * 0.010)) | 1
-    m = cv2.dilate((seg_win > 0.25).astype(np.float32), np.ones((k, k), np.uint8))
-    return np.clip(cv2.GaussianBlur(m, (0, 0), k * 0.7), 0, 1)
+    """Soft mask over the window UNIT (glass + frame/mullions) used to keep the window
+    out of the indoor enhance. It follows the SegFormer window region itself — which
+    already excludes curtains/walls — so we only FILL the mullion gaps and feather the
+    edge; we do NOT dilate broadly (a broad dilation used to bleed the mask onto the
+    curtains and the wall around the window, which looked like mis-segmentation)."""
+    m = (seg_win > 0.25).astype(np.float32)
+    k = max(3, int(w * 0.006)) | 1
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))   # fill mullions
+    m = cv2.dilate(m, np.ones((3, 3), np.uint8))                          # thin frame lip
+    return np.clip(cv2.GaussianBlur(m, (0, 0), max(2.0, w * 0.0015)), 0, 1)
 
 
 def _debug_overlay(base_u8, mask, colour=(0, 200, 0), alpha=0.45):
@@ -305,6 +331,52 @@ def _pick_window_bracket(images, seg_win):
         if score > best_score:
             best_score, best_i = score, i
     return best_i
+
+
+def _pick_frame_bracket(images, seg_win):
+    """Pick the bracket where the window FRAME / mullions / rail / valance are best
+    exposed AND crisp.
+
+    The frame is an INDOOR-lit surface: it is a near-black silhouette in the darkest
+    bracket (which is exposed for the outdoors) and only becomes visible in a brighter
+    one. We isolate the frame as the window-region pixels that stay DARK in the darkest
+    bracket, then score each bracket by the well-exposed detail (gradient magnitude)
+    over those pixels; the bracket with the most detail wins. Using a SINGLE bracket
+    for the frame (instead of the soft multi-bracket Mertens fusion) keeps the rail
+    sharp and free of the doubled/ghosted edge. `images` is sorted darkest->brightest;
+    returns the chosen index (defaults to the brightest when there is no real frame).
+    """
+    reg = seg_win > 0.3
+    if int(reg.sum()) < 50:
+        return len(images) - 1
+    d = images[0].astype(np.float32) / 255.0
+    dl = d.mean(axis=2)
+    dc = d.max(axis=2) - d.min(axis=2)
+    # REAL frame = window pixels that are near-black AND achromatic in the darkest
+    # bracket (grey/black bars). The achromatic test is what excludes dark FOLIAGE seen
+    # through the glass (green/colourful, dark) — otherwise the foliage's detail peaks in
+    # the VIEW bracket and drags the pick back onto a dark bracket, dark-silhouetting the
+    # frame (the exact regression this guards against).
+    frame_reg = reg & (dl < 0.18) & (dc < 0.06)
+    n_fr = int(frame_reg.sum())
+    if n_fr < 50:
+        return len(images) - 1
+    # Pick the bracket where the frame is best EXPOSED — its median brightness closest to
+    # a natural indoor grey (~0.62). NOT gradient: the frame/glass boundary contrast is
+    # always sharpest in the darkest brackets, which would silhouette the frame; we want
+    # the bracket that actually LIGHTS the frame surface so the rail/mullions read bright
+    # and match the room. A single bracket is still crisp (no fused blend).
+    target = 0.62
+    best_i, best_err = -1, 1e9
+    for i, im in enumerate(images):
+        g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        fb = float(np.median(g[frame_reg]))
+        if fb < 0.30:                    # frame still a silhouette in this bracket — skip
+            continue
+        err = abs(fb - target)
+        if err < best_err:
+            best_err, best_i = err, i
+    return best_i if best_i >= 0 else len(images) - 1     # else the brightest bracket
 
 
 def pull_window_view(base, view_u8, dark_u8, seg_win, clip_lo=0.72,
@@ -592,30 +664,70 @@ def process_brackets(images, enhance=True, max_width=4000, pull_windows=False,
     if return_debug:                       # raw Mertens fusion the pipeline starts from
         dbg["fused"] = (np.clip(fused, 0, 1) * 255).astype("uint8")
 
-    # ---- WINDOW DETECTION (needed by the finishing exclusion AND the window pull)
+    # ---- SEGMENTATION — SegFormer classes on the well-exposed FUSED image; the SURROUND
+    #   (curtains / blinds) is then SAM-refined to a PIXEL-precise edge and SUBTRACTED from
+    #   the window. Why this split: a curtain is a solid object, so a MobileSAM box prompt
+    #   captures it completely and crisply — perfect for cutting it cleanly out of the
+    #   window. The window OPENING, by contrast, is sky + pool + trees (many objects), so a
+    #   box prompt would grab only the brightest one (the sky) and miss the rest; there we
+    #   keep SegFormer's complete region. Net: complete window, curtains precisely deducted
+    #   so they get the normal indoor HDR and never the pulled outdoor view. Falls back to
+    #   plain SegFormer if SAM is unavailable, and to classical clipping if SegFormer is.
     masks = None
     seg_win = None
+    seg_curtain = None            # the window "surround": curtains / blinds / valances
+    fused_u8 = (np.clip(fused, 0, 1) * 255).astype("uint8")
     if enhance or pull_windows:
-        # WINDOW segmentation from the SUPER-DARKEST bracket (lowest hallucination:
-        # only real windows still show outdoor light there), notwindow subtracted.
-        # get_label_masks returns None if torch/transformers are unavailable.
-        dmasks = window_mask.get_label_masks(images[0])
-        seg_win = dmasks["window"] if dmasks else None
-        if seg_win is not None and dmasks.get("notwindow") is not None:
-            nwd = cv2.dilate(dmasks["notwindow"],
+        # WINDOW is detected on the DARKEST bracket, where the exterior VIEW is visible.
+        # A small or bright window blows to pure white in the fusion, and SegFormer then
+        # reads it as white wall, not "windowpane" (test2: 3.3% on darkest vs 0.4% on
+        # fused) — so detecting on the fusion misses exactly the small windows we care
+        # about. Interior + curtain classes still come from the well-lit FUSED image.
+        draw = window_mask.get_label_map(images[0])
+        dmasks = window_mask.masks_from_label_map(draw) if draw is not None else None
+        raw = window_mask.get_label_map(fused_u8)          # interior/curtain on fused
+        masks = window_mask.masks_from_label_map(raw) if raw is not None else None
+        # window: prefer the darkest detection, fall back to the fused one. Split the two
+        # window classes: WINDOWPANE (8) is kept leniently (even dim/shaded windows), but
+        # DOOR (14) is kept ONLY where it's a real GLASS door (exterior view) — a solid
+        # closet/panel door is also ADE 'door' and would otherwise be pulled & haloed.
+        notwin = None
+        if draw is not None:
+            seg_win = np.isin(draw, (8,)).astype(np.float32)          # windowpane
+            doorm = np.isin(draw, (14,)).astype(np.float32)          # door (glass OR solid)
+            if float(doorm.sum()) > 0:
+                seg_win = np.clip(seg_win + _keep_glass_doors(doorm, images[0]), 0, 1)
+            notwin = dmasks.get("notwindow") if dmasks else None
+        elif masks and masks.get("window") is not None:
+            seg_win = masks["window"].copy()
+            notwin = masks.get("notwindow")
+        if seg_win is not None and notwin is not None:
+            nwd = cv2.dilate(notwin,
                              np.ones((max(3, int(w * 0.004) | 1),) * 2, np.uint8))
             seg_win = np.clip(seg_win - nwd, 0, 1)
-        if enhance:
-            # interior masks (mid frame): wall/ceiling, floor, lamp, cabinet.
-            masks = window_mask.get_label_masks(mid)
-            # SAFETY fallback to the mid-frame window mask if the darkest found none.
-            if (seg_win is None or float((seg_win > 0.3).sum()) < 1) \
-                    and masks and masks.get("window") is not None:
-                seg_win = masks["window"].copy()
-                if masks.get("notwindow") is not None:
-                    nwm = cv2.dilate(masks["notwindow"],
-                                     np.ones((max(3, int(w * 0.004) | 1),) * 2, np.uint8))
-                    seg_win = np.clip(seg_win - nwm, 0, 1)
+        if masks:
+            # SURROUND: curtains / blinds from the well-lit fusion, SAM-refined so the
+            # drape edge is pixel-exact.
+            cc = masks.get("curtain")
+            if cc is not None and float((cc > 0.3).sum()) > 0:
+                seg_curtain = sam_refine.refine_binary(fused_u8, cc > 0.3)
+        # SUBTRACT the surround from the window — but ONLY where the darkest bracket is
+        # NOT see-through. An opaque drape or a CLOSED blind is dark in the exterior-metered
+        # darkest bracket, so it IS removed (it gets the normal indoor HDR). But where the
+        # exterior view shows through (bright OR colourful — e.g. between OPEN blind slats)
+        # we KEEP it as window so the pull still brings the view. Without this gate, a blind
+        # that SegFormer labels over the whole window would delete the entire window and it
+        # blows out (test2 / test4 went blank).
+        if seg_win is not None and seg_curtain is not None:
+            cd = cv2.dilate(seg_curtain,
+                            np.ones((max(3, int(w * 0.004) | 1),) * 2, np.uint8))
+            d = images[0].astype(np.float32) / 255.0
+            dl = d.mean(axis=2)
+            dc = d.max(axis=2) - d.min(axis=2)
+            view_dark = np.maximum(np.clip((dl - 0.06) / 0.10, 0, 1),
+                                   np.clip((dc - 0.05) / 0.08, 0, 1))
+            remove = cd * (view_dark < 0.4).astype(np.float32)
+            seg_win = np.clip(seg_win - remove, 0, 1)
         # LIGHT-THROUGH gate: keep only windows light actually comes through.
         if seg_win is not None:
             darkest = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
@@ -664,43 +776,70 @@ def process_brackets(images, enhance=True, max_width=4000, pull_windows=False,
     #       (white halos on water, washed trees), so we HDR the INDOOR ONLY and
     #       restore the window — glass AND frame — from that improved fused image.
     if enhance and have_window and not pull_windows:
-        vi = _pick_window_bracket(images, seg_win)
-        if vi != 0:
-            print(f" * window: using bracket #{vi} of {len(images)} (darkest=0) "
-                  f"for a crisp view — the Mertens blend washed it out")
+        # The window UNIT (glass + frame) is rebuilt from TWO SINGLE crisp brackets and
+        # NEVER from the soft multi-bracket Mertens fusion — that fusion is what left the
+        # frame/rail soft & doubled and let moving foliage / drifting clouds ghost:
+        #   * GLASS / view  -> _pick_window_bracket: the darker bracket with the clearest
+        #     exterior view. A single bracket has no inter-bracket blend, so nothing can
+        #     ghost and the sky/foliage stay crisp and correctly exposed.
+        #   * FRAME / rail  -> _pick_frame_bracket: the brighter bracket where the frame,
+        #     mullions and valance are well lit AND sharp. Single-source => the rail is
+        #     as crisp as the glass, no soft ghost edge.
+        vi = _pick_window_bracket(images, seg_win)         # glass / view bracket
+        fi = _pick_frame_bracket(images, seg_win)          # frame / rail bracket
+        print(f" * window: glass from bracket #{vi}, frame from bracket #{fi} "
+              f"of {len(images)} (darkest=0) — both single & crisp, no fused blend")
         raw = images[vi].astype(np.float32) / 255.0
+        frame_src = images[fi].astype(np.float32) / 255.0
         vlum = raw.mean(axis=2)
         vchr = raw.max(axis=2) - raw.min(axis=2)
-        # keep the bright fused FRAME/mullions: bring the crisp view in ONLY where the
-        # chosen bracket is the actual see-through view (BRIGHT or COLOURFUL). The
-        # window's frame/mullions are dark in that (darker) bracket, so they score ~0
-        # and the fused BRIGHT frame shows there — view gets crisp, frame stays bright.
+        # see-through view = BRIGHT or COLOURFUL in the glass bracket; the frame/mullions
+        # are near-black there and score ~0, so they come from the frame bracket instead.
         litw = np.maximum(np.clip((vlum - 0.06) / 0.10, 0, 1),
                           np.clip((vchr - 0.05) / 0.08, 0, 1))
-        sel = seg_win > 0.3
+        sel = (seg_win > 0.3) & (litw > 0.4)               # measure over the GLASS only
         med = float(np.median(vlum[sel])) if sel.any() else 0.0
         view = raw
-        if 1e-3 < med < 0.58:                          # gentle lift, keep contrast
+        if 1e-3 < med < 0.58:                              # gentle lift, keep contrast
             view = np.clip(raw, 0, 1) ** float(np.clip(
                 np.log(0.58) / np.log(med), 0.6, 1.0))
-        # FULL-opacity crisp view across the whole detected window (binary + holes
-        # filled) so a soft/weak SegFormer mask can't leave the glass half-composited
-        # (that half-mix with the washed fusion = the pale/washed water). `litw` still
-        # gates it so the dark FRAME/mullions keep the bright fused pixels.
+        # Assemble the whole window unit from the two SINGLE brackets — crisp view on the
+        # see-through glass, crisp lit frame everywhere else. The glass alpha is feathered
+        # ONLY at the glass<->frame boundary, snapped to the glass bracket's own edges, so
+        # the join is tight (no halo). No `fused` pixels enter the window at all.
         win = (np.clip(seg_win, 0, 1) > 0.25).astype(np.float32)
         kf = max(3, int(w * 0.006)) | 1
         win = cv2.morphologyEx(win, cv2.MORPH_CLOSE, np.ones((kf, kf), np.uint8))
-        gm = _feather_edge(win * litw, fused)[..., None]
-        fused = fused * (1 - gm) + view * gm           # crisp view into the glass only
+        gm = _feather_edge(win * litw, raw)[..., None]     # glass alpha; snaps to view edges
+        window_unit = frame_src * (1 - gm) + view * gm     # single-source glass + frame
         wm = _window_protect_mask(seg_win, w)[..., None]
-        img = img * (1 - wm) + fused * wm
+        img = img * (1 - wm) + window_unit * wm
         if return_debug:
             base = dbg.get("fused")
-            # GREEN = window region kept out of the indoor enhance (the exclusion);
-            # BLUE  = where the crisp single-bracket view is composited (the glass).
+            # Each part of the scene shown in its own colour so the separation is clear:
+            #   GREEN   = whole window UNIT kept out of the indoor enhance
+            #   CYAN    = the OUTDOOR VIEW (glass) — where the crisp exterior is composited
+            #   ORANGE  = the FRAME / mullions / rail — from the lit frame bracket
             dbg["window_excluded"] = _debug_overlay(base, wm[..., 0], (0, 200, 0))
-            dbg["window_glass"] = _debug_overlay(base, gm[..., 0], (230, 120, 0))
+            dbg["window_glass"] = _debug_overlay(base, gm[..., 0], (230, 160, 0))
+            frame_disp = np.clip(win - gm[..., 0], 0, 1)
+            dbg["window_frame"] = _debug_overlay(base, frame_disp, (0, 130, 255))
             dbg["window_bracket"] = vi     # which bracket supplied the window view
+            dbg["frame_bracket"] = fi      # which bracket supplied the frame
+            # COMBINED map — one image, every part colour-coded together:
+            #   CYAN = glass/outdoor view · ORANGE = frame/mullions · MAGENTA = curtains
+            combo = base.astype(np.float32)
+            for msk, col in ((gm[..., 0], (200, 200, 0)),            # glass  (cyan)
+                             (frame_disp, (0, 140, 255)),            # frame  (orange)
+                             (np.clip(seg_curtain, 0, 1) if seg_curtain is not None
+                              else None, (200, 0, 200))):            # curtain (magenta)
+                if msk is None:
+                    continue
+                a = np.clip(msk, 0, 1)[..., None] * 0.55
+                tint = np.zeros_like(combo)
+                tint[:] = col
+                combo = combo * (1 - a) + tint * a
+            dbg["segments"] = combo.clip(0, 255).astype("uint8")
 
     # SHARPEN — clarity damped in a band around the window so the high-contrast
     # window boundary can't halo.
@@ -718,8 +857,35 @@ def process_brackets(images, enhance=True, max_width=4000, pull_windows=False,
 
     result = (img * 255).clip(0, 255).astype("uint8")
     if return_debug:
-        # if no window was detected, still expose the window overlays (= no selection)
-        dbg.setdefault("window_excluded", dbg.get("fused"))
-        dbg.setdefault("window_glass", dbg.get("fused"))
+        base = dbg.get("fused")
+        # MAGENTA = the window SURROUND (curtains / blinds / valances) — segmented
+        # separately and SUBTRACTED from the window, so it gets the normal indoor HDR
+        # and never receives the pulled outdoor view.
+        if seg_curtain is not None:
+            dbg["surround"] = _debug_overlay(base, np.clip(seg_curtain, 0, 1),
+                                             (200, 0, 200))
+        # OUTDOOR breakdown (approximate) — classify the exterior view inside the glass by
+        # colour: sky / water / green / other. Best-effort; small back-lit views are hard.
+        if have_window:
+            gi = _pick_window_bracket(images, seg_win)
+            ob = window_mask.classify_outdoor_pixels(images[gi], seg_win > 0.3)
+            ov = base.astype(np.float32)
+            for key, col in (("sky", (255, 150, 0)), ("water", (255, 255, 0)),
+                             ("green", (0, 200, 0)), ("build", (0, 140, 255))):
+                m = ob.get(key)
+                if m is None:
+                    continue
+                a = m[..., None].astype(np.float32) * 0.5
+                tint = np.zeros_like(ov)
+                tint[:] = col
+                ov = ov * (1 - a) + tint * a
+            dbg["outdoor"] = ov.clip(0, 255).astype("uint8")
+        # if no window was detected, still expose the overlays (= no selection)
+        dbg.setdefault("surround", base)
+        dbg.setdefault("window_excluded", base)
+        dbg.setdefault("window_glass", base)
+        dbg.setdefault("window_frame", base)
+        dbg.setdefault("outdoor", base)
+        dbg.setdefault("segments", base)
         return result, dbg
     return result

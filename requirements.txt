@@ -13,3 +13,10 @@ flask>=2.0
 # mask (less precise on scenes with bright white appliances).
 torch>=1.13
 transformers>=4.25
+
+# MobileSAM (via ultralytics) refines the coarse SegFormer curtain/blind SURROUND mask
+# to a PIXEL-precise, edge-snapped boundary, so curtains are cut cleanly out of the
+# window (they get the normal indoor HDR, never the pulled outdoor view). The ~40 MB
+# mobile_sam.pt weights download automatically on first use. OPTIONAL: if ultralytics
+# is not installed, sam_refine falls back to SegFormer's coarser boundaries.
+ultralytics>=8.1

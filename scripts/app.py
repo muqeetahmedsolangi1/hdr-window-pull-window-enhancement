@@ -95,17 +95,28 @@ fused view (the clearest bracket) and is never blown out &mdash; pure OpenCV.</d
 {% endif %}
 {% if debug %}
 <div class="card">
-  <b>Debug &mdash; what the pipeline sees</b>
-  <div class="sub" style="margin:4px 0 0">The raw fused image the pipeline starts from, and the window
-  selection (which pixels are treated as the window).</div>
+  <b>Debug &mdash; how the window is separated</b>
+  <div class="sub" style="margin:4px 0 0">The scene is split into parts, each segmented on its own:
+  the <b>surround</b> (curtains/blinds/valances) is deducted and gets the normal indoor HDR;
+  only the <b>outdoor view</b> (glass) receives the crisp exterior; the <b>frame</b> comes from the
+  lit frame bracket.</div>
   <div class="grid">
+    {% if debug.segments %}<div class="thumb"><img src="/result/{{ debug.segments }}">
+      <div><b>All segments</b> &mdash; <span style="color:#08a;font-weight:700">cyan</span> glass/view &middot; <span style="color:#e70;font-weight:700">orange</span> frame &middot; <span style="color:#c0c;font-weight:700">magenta</span> curtains</div></div>{% endif %}
     {% if debug.fused %}<div class="thumb"><img src="/result/{{ debug.fused }}">
       <div><b>Fused (Mertens)</b> &mdash; the base going in</div></div>{% endif %}
+    {% if debug.surround %}<div class="thumb"><img src="/result/{{ debug.surround }}">
+      <div><span style="color:#c0c;font-weight:700">magenta</span> = surround (curtains / blinds) &mdash; deducted, gets indoor HDR</div></div>{% endif %}
     {% if debug.window_excluded %}<div class="thumb"><img src="/result/{{ debug.window_excluded }}">
-      <div><span style="color:#0a0;font-weight:700">green</span> = window kept OUT of the indoor enhance</div></div>{% endif %}
+      <div><span style="color:#0a0;font-weight:700">green</span> = whole window unit kept OUT of the indoor enhance</div></div>{% endif %}
     {% if debug.window_glass %}<div class="thumb"><img src="/result/{{ debug.window_glass }}">
-      <div><span style="color:#06c;font-weight:700">blue</span> = where the crisp view is composited (glass)</div></div>{% endif %}
+      <div><span style="color:#08a;font-weight:700">cyan</span> = OUTDOOR VIEW (glass) &mdash; crisp exterior composited here</div></div>{% endif %}
+    {% if debug.window_frame %}<div class="thumb"><img src="/result/{{ debug.window_frame }}">
+      <div><span style="color:#e70;font-weight:700">orange</span> = FRAME / mullions / rail &mdash; from the lit frame bracket</div></div>{% endif %}
+    {% if debug.outdoor %}<div class="thumb"><img src="/result/{{ debug.outdoor }}">
+      <div><b>outdoor view</b> (approx) &mdash; <span style="color:#08a">sky</span> / <span style="color:#0aa">water</span> / <span style="color:#0a0">green</span> / <span style="color:#e70">other</span></div></div>{% endif %}
   </div>
+  <div class="sub" style="margin:8px 0 0">Boundaries are refined with <b>MobileSAM</b> (pixel-precise, edge-snapped); the outdoor breakdown is best-effort.</div>
 </div>
 {% endif %}
 {% if error %}<div class="card" style="color:#b00">{{ error }}</div>{% endif %}
@@ -230,7 +241,8 @@ def index():
     name = f"hdr_{stamp}.jpg"
     cv2.imwrite(os.path.join(RESULTS, name), res, [cv2.IMWRITE_JPEG_QUALITY, 95])
     debug = {}
-    for key in ("fused", "window_excluded", "window_glass"):
+    for key in ("segments", "fused", "surround", "window_excluded", "window_glass",
+                "window_frame", "outdoor"):
         if dbg.get(key) is not None:
             dn = f"dbg_{key}_{stamp}.jpg"
             cv2.imwrite(os.path.join(RESULTS, dn), dbg[key], [cv2.IMWRITE_JPEG_QUALITY, 88])
