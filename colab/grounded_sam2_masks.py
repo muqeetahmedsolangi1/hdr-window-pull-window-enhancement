@@ -40,19 +40,69 @@ print("models loaded")
 # ============================== CELL 3 — upload BRACKETS, build fused ==========
 # Select ALL the exposure brackets of ONE scene (e.g. the 7-8 test-7 / test4 JPGs).
 from google.colab import files
+import math
 up = files.upload()
 paths = sorted(up.keys())
-imgs = [cv2.imread(p) for p in paths]
-imgs = [im for im in imgs if im is not None]
-# resize to a common width, sort darkest -> brightest
+
+
+def _exptime(path):
+    """EXIF exposure time (seconds) — used to label each bracket with its EV."""
+    try:
+        from PIL import Image as PImage, ExifTags
+        ex = PImage.open(path)._getexif() or {}
+        tags = {v: k for k, v in ExifTags.TAGS.items()}
+        t = ex.get(tags.get("ExposureTime"))
+        return float(t) if t else None
+    except Exception:
+        return None
+
+
+# resize to a common width, keep the file/EXIF with each image, sort darkest -> brightest
 W = 2000
-res = []
-for im in imgs:
+items = []
+for p in paths:
+    im = cv2.imread(p)
+    if im is None:
+        continue
     h, w = im.shape[:2]
     if w != W:
         im = cv2.resize(im, (W, int(h * W / w)), interpolation=cv2.INTER_AREA)
-    res.append(im)
-res.sort(key=lambda im: im.mean())
+    items.append({"img": im, "name": p, "t": _exptime(p)})
+items.sort(key=lambda it: it["img"].mean())
+res = [it["img"] for it in items]
+
+# EV of each bracket, relative to the median exposure time (same as the local app)
+times = [it["t"] for it in items if it["t"]]
+med_t = sorted(times)[len(times) // 2] if times else None
+EVS = []
+for it in items:
+    ev = round(math.log2(it["t"] / med_t), 1) if (it["t"] and med_t) else None
+    it["ev"] = ev
+    EVS.append(ev)
+
+# ---- SHOW every input bracket with its EV (darkest -> brightest) ----
+tiles = []
+th_h = int(res[0].shape[0] * 330 / W)
+for i, it in enumerate(items):
+    th = cv2.resize(it["img"], (330, th_h))
+    ev = f"EV {it['ev']:+g}" if it["ev"] is not None else "EV ?"
+    role = " DARKEST" if i == 0 else ""
+    cv2.rectangle(th, (0, 0), (329, 30), (0, 0, 0), -1)
+    cv2.putText(th, f"#{i} {ev}{role}", (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 255, 0) if i == 0 else (255, 255, 255), 2)
+    tiles.append(th)
+rows = [np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]
+if len(rows) > 1 and rows[-1].shape[1] != rows[0].shape[1]:
+    pad = np.zeros((rows[-1].shape[0], rows[0].shape[1] - rows[-1].shape[1], 3), np.uint8)
+    rows[-1] = np.hstack([rows[-1], pad])
+cv2.imwrite("inputs_ev.jpg", np.vstack(rows), [cv2.IMWRITE_JPEG_QUALITY, 90])
+print("input brackets (darkest -> brightest):",
+      [f"#{i} EV{e:+g}" if e is not None else f"#{i} ?" for i, e in enumerate(EVS)])
+try:
+    from IPython.display import Image as _Img, display
+    display(_Img("inputs_ev.jpg"))
+except Exception:
+    pass
 
 # ALIGN every bracket to the middle one (ECC homography) BEFORE fusing — without this the
 # window pull composites slightly-shifted brackets and the view comes out washed/milky
@@ -85,6 +135,18 @@ fused = (cv2.createMergeMertens().process(res) * 255).clip(0, 255).astype("uint8
 cv2.imwrite("fused.jpg", fused)
 print(f"{len(res)} brackets (aligned) -> fused {fused.shape[1]}x{fused.shape[0]}; darkest mean={res[0].mean():.0f}")
 
+# show the darker image kept for the fusion gates + the fused base
+cv2.imwrite("darkest.jpg", darkest, [cv2.IMWRITE_JPEG_QUALITY, 90])
+try:
+    from IPython.display import Image as _Img, display
+    ev0 = f"EV {EVS[0]:+g}" if EVS and EVS[0] is not None else "EV ?"
+    print(f"DARKEST bracket used at fusion time (#0, {ev0}):")
+    display(_Img("darkest.jpg"))
+    print("FUSED (Mertens, aligned brackets):")
+    display(_Img("fused.jpg"))
+except Exception:
+    pass
+
 
 # ============================== CELL 4 — helpers ==============================
 def detect(bgr, phrase, box_t=0.25, text_t=0.20):
@@ -105,10 +167,15 @@ def detect(bgr, phrase, box_t=0.25, text_t=0.20):
 
 
 def segment(bgr, boxes):
-    """SAM 2.1: union of pixel-precise masks for the given boxes."""
+    """SAM 2.1: union of pixel-precise masks for the given boxes.
+    retina_masks=True -> masks come back at the image's native resolution (no blocky
+    quarter-res upsampling), so the boundaries are as fine as SAM can produce."""
     if len(boxes) == 0:
         return np.zeros(bgr.shape[:2], bool)
-    r = sam(bgr, bboxes=boxes.tolist(), verbose=False)
+    try:
+        r = sam(bgr, bboxes=boxes.tolist(), retina_masks=True, verbose=False)
+    except TypeError:
+        r = sam(bgr, bboxes=boxes.tolist(), verbose=False)
     if not r or r[0].masks is None:
         return np.zeros(bgr.shape[:2], bool)
     return r[0].masks.data.cpu().numpy().astype(bool).any(axis=0)
@@ -126,38 +193,93 @@ def overlay(base_bgr, mask, colour):
 
 
 # ============================== CELL 5 — per-concept detect + segment =========
-# Structural concepts read on the FUSED image; VIEW concepts on the DARKEST bracket.
-STRUCT = ["curtain", "blind", "window", "window frame", "glass door", "wall", "floor"]
-VIEW = ["sky", "water", "tree", "umbrella"]     # umbrella is OUTDOOR view, not a curtain
+# ONLY window-related things are segmented: curtains/blinds, the window, its frame and
+# glass doors — nothing else in the room is selected.
+STRUCT = ["curtain", "blind", "window", "window frame", "glass door"]
+# NO outdoor "view" concepts (sky/water/tree/umbrella) — Grounding DINO detecting "sky"
+# INSIDE a room is unreliable and painted ceiling patches into the mask (the fake-sky /
+# dark-ceiling-blob bug). The glass area comes from the window masks alone.
+VIEW = []
+# SYNONYM ensemble: each concept is detected with several phrasings and the boxes are
+# UNIONED — one phrasing often misses an instance that another catches (recall boost).
+SYN = {"window": ["window", "windowpane", "sliding glass window"],
+       "curtain": ["curtain", "drape"],
+       "blind": ["blind", "venetian blind", "window shade"]}
 COLOURS = {"curtain": (200, 0, 200), "blind": (200, 0, 120), "window": (200, 200, 0),
-           "window frame": (0, 140, 255), "glass door": (0, 90, 255), "wall": (120, 120, 120),
-           "floor": (60, 90, 160), "sky": (255, 150, 0), "water": (255, 255, 0),
+           "window frame": (0, 140, 255), "glass door": (0, 90, 255),
+           "sky": (255, 150, 0), "water": (255, 255, 0),
            "tree": (0, 200, 0), "umbrella": (0, 200, 200)}
 
-# see-through EXTERIOR mask (from the darkest bracket): bright OR colourful = outdoors.
-# Used to strip exterior objects (a closed pool umbrella) that get mislabelled 'curtain'.
-_d = darkest.astype(np.float32) / 255
-_dl = _d.mean(2); _dc = _d.max(2) - _d.min(2)
-SEETHRU = np.maximum(np.clip((_dl - 0.06) / 0.10, 0, 1),
-                     np.clip((_dc - 0.05) / 0.08, 0, 1)) > 0.4
+# ---------------- VIEW IMAGE: uploaded BY YOU (no auto-select) ----------------
+# Upload the ONE image whose window view you want composited into the glass — usually
+# the darker bracket where the outdoor looks clearest to YOUR eye. It is resized and
+# ECC-aligned to the same reference the brackets were aligned to, so it lines up exactly.
+print(">>> Upload the DARKER / VIEW image now (the one whose window view you want):")
+vup = files.upload()
+vpath = list(vup.keys())[0]
+viewimg = cv2.imread(vpath)
+vh, vw = viewimg.shape[:2]
+if vw != W:
+    viewimg = cv2.resize(viewimg, (W, int(vh * W / vw)), interpolation=cv2.INTER_AREA)
+
+# align the uploaded image to the brackets' alignment reference (the middle bracket)
+_refimg = res[len(res) // 2]
+try:
+    s = min(1.0, 1000 / W)
+    g_ref = cv2.equalizeHist(cv2.resize(cv2.cvtColor(_refimg, cv2.COLOR_BGR2GRAY), None,
+                                        fx=s, fy=s, interpolation=cv2.INTER_AREA))
+    g_v = cv2.equalizeHist(cv2.resize(cv2.cvtColor(viewimg, cv2.COLOR_BGR2GRAY), None,
+                                      fx=s, fy=s, interpolation=cv2.INTER_AREA))
+    warp = np.eye(3, dtype=np.float32)
+    cv2.findTransformECC(g_ref, g_v, warp, cv2.MOTION_HOMOGRAPHY,
+                         (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5), None, 5)
+    S = np.diag([s, s, 1.0])
+    Hm = (np.linalg.inv(S) @ warp.astype(np.float64) @ S).astype(np.float32)
+    viewimg = cv2.warpPerspective(viewimg, Hm, (_refimg.shape[1], _refimg.shape[0]),
+                                  flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                  borderMode=cv2.BORDER_REPLICATE)
+    print(" * view image aligned to the brackets")
+except cv2.error:
+    print(" * WARNING: alignment failed — using the uploaded image as-is")
+
+_t = _exptime(vpath)
+_ev = round(math.log2(_t / med_t), 1) if (_t and med_t) else None
+VIEW_DESC = f"your uploaded image '{vpath}'" + (f" (EV {_ev:+g})" if _ev is not None else "")
+print(f"view source = {VIEW_DESC}  (mean {viewimg.mean():.0f})")
+cv2.imwrite("view_bracket.jpg", viewimg, [cv2.IMWRITE_JPEG_QUALITY, 90])
+try:
+    from IPython.display import Image as _Img, display
+    print("VIEW image (this exact photo will fill the glass):")
+    display(_Img("view_bracket.jpg"))
+except Exception:
+    pass
 
 os.makedirs("out", exist_ok=True)
 concept_masks = {}
+concept_boxes = {}          # the raw DINO rectangles — CELL 8 uses the window/door boxes
 print("=== per-concept detection ===")
 for name in STRUCT + VIEW:
-    src = darkest if name in VIEW else fused
-    boxes, scores = detect(src, name)
+    src = viewimg if name in VIEW else fused
+    # synonym-ensemble detection: union the boxes from every phrasing of this concept
+    all_boxes, top = [], 0.0
+    for phrase in SYN.get(name, [name]):
+        bxs, scs = detect(src, phrase)
+        if len(bxs):
+            all_boxes.append(bxs)
+            top = max(top, float(scs.max()))
+    boxes = np.vstack(all_boxes) if all_boxes else np.zeros((0, 4))
     m = segment(src, boxes)
-    # curtains/blinds are OPAQUE indoor fabric — drop any part that is really the
-    # see-through exterior (fixes the pool umbrella being called a curtain).
-    if name in ("curtain", "blind"):
-        m = m & (~SEETHRU)
+    # NOTE: no brightness-based stripping here. The old `& ~SEETHRU` gate deleted the
+    # SUNLIT parts of sheer curtains from the curtain mask, so they weren't subtracted
+    # from the glass later and got composited DARK (the black-curtain bug). Curtain vs
+    # umbrella is handled geometrically in CELL 8 (rod-hung components only).
     concept_masks[name] = m
+    concept_boxes[name] = boxes
     ov = overlay(fused, m, COLOURS.get(name, (255, 255, 255)))   # always show on fused
     cv2.imwrite(f"out/overlay_{name.replace(' ', '_')}.jpg", ov, [cv2.IMWRITE_JPEG_QUALITY, 92])
     cv2.imwrite(f"out/mask_{name.replace(' ', '_')}.png", (m.astype(np.uint8) * 255))
-    sc = f"{scores.max():.2f}" if len(scores) else "-"
-    print(f"  {name:14s} on {'darkest' if name in VIEW else 'fused ':7s}: "
+    sc = f"{top:.2f}" if len(boxes) else "-"
+    print(f"  {name:14s} on {'view' if name in VIEW else 'fused':8s}: "
           f"{len(boxes):2d} boxes, area={m.mean()*100:5.1f}%, top_score={sc}")
 
 
@@ -274,72 +396,136 @@ def _pick_frame(brackets, seg, target=0.62):
 print("helpers ready")
 
 
-# ============================== CELL 8 — run enhance + window pull =============
+# ============================== CELL 8 — enhance INDOOR only; CRISP outdoor view ======
+# Enhance the indoor (room, curtains, frame). The GLASS / OUTDOOR VIEW gets NO HDR —
+# instead it is composited from the SINGLE EV bracket where the view is CLEAREST
+# (picked in CELL 5), so it is crisp and never washed out by the Mertens blend.
+# Also shows the fused image so you can see the base going in.
 H, Wd = fused.shape[:2]
-zeros = np.zeros((H, Wd), bool)
-
-# window = window (+ glass door) from SAM; surround = curtain (+ blind)
-win = concept_masks.get("window", zeros).astype(np.float32)
-if concept_masks.get("glass door") is not None:
-    win = np.clip(win + concept_masks["glass door"], 0, 1)
-curt = concept_masks.get("curtain", zeros).astype(np.float32)
-if concept_masks.get("blind") is not None:
-    curt = np.clip(curt + concept_masks["blind"], 0, 1)
-
-# subtract surround from window ONLY where the darkest bracket is NOT see-through
-d = darkest.astype(np.float32)/255; dl = d.mean(2); dc = d.max(2)-d.min(2)
-view_dark = np.maximum(np.clip((dl-0.06)/0.10, 0, 1), np.clip((dc-0.05)/0.08, 0, 1))
 k = max(3, int(Wd*0.004) | 1)
-cd = cv2.dilate(curt, np.ones((k, k), np.uint8))
-seg_win = np.clip(win - cd*(view_dark < 0.4).astype(np.float32), 0, 1)
-have_win = float(seg_win.max()) > 1e-3
 
+def _u(*names):
+    m = np.zeros((H, Wd), np.float32)
+    for n in names:
+        cm = concept_masks.get(n)
+        if cm is not None:
+            m = np.clip(m + (cm > 0).astype(np.float32), 0, 1)
+    return m
+
+# =================== GLASS-ONLY MASK — pure geometry, no brightness gates ===============
+# Root-cause redesign. Every previous failure came from (a) detecting outdoor concepts
+# (sky/tree) INDOORS -> ceiling blobs, and (b) brightness thresholds -> holes on shaded
+# view content + sunlit curtains stripped. Now: only the window/glass-door SAM masks
+# define WHERE glass can be; curtains and frame are removed by GEOMETRY.
+
+# 1) WINDOW area = SAM masks for window + glass door ONLY. Erode a small lip so the
+#    OUTER frame edge is excluded from the start.
+WIN = _u("window", "glass door") > 0.5
+lip = max(3, int(Wd * 0.004) | 1)
+WIN_IN = cv2.erode(WIN.astype(np.uint8), np.ones((lip, lip), np.uint8)).astype(bool)
+
+# 2) CURTAINS: keep only ROD-HUNG components (top of the component in the upper part of
+#    the image). Real curtains hang from a rod; a pool umbrella / outdoor chair that DINO
+#    mislabelled 'curtain' is a mid-window blob and is ignored. NO brightness test, so a
+#    sunlit sheer curtain stays a curtain and can never be composited dark again.
+curt_raw = (_u("curtain", "blind") > 0.5).astype(np.uint8)
+ncc, lab, st, _ = cv2.connectedComponentsWithStats(curt_raw)
+CURT = np.zeros(curt_raw.shape, bool)
+for i in range(1, ncc):
+    if st[i, cv2.CC_STAT_TOP] < 0.45 * H and st[i, cv2.CC_STAT_AREA] > 0.0005 * H * Wd:
+        CURT |= (lab == i)
+
+# 3) FRAME / MULLIONS: they are THIN, ACHROMATIC structures inside the window. A wide
+#    morphological OPEN erases thin bars but keeps large blobs — so grey pavement, signs
+#    or shaded patio (large achromatic blobs) STAY in the view (no holes), while every
+#    white or dark bar is removed regardless of its brightness (white frames too).
+v = viewimg.astype(np.float32) / 255; vl = v.mean(2); vc = v.max(2) - v.min(2)
+achro = (vc < 0.07) & WIN_IN
+bar_k = max(5, int(Wd * 0.014) | 1)
+blobs = cv2.morphologyEx(achro.astype(np.uint8), cv2.MORPH_OPEN,
+                         np.ones((bar_k, bar_k), np.uint8)).astype(bool)
+FRAME = (achro & ~blobs) | (achro & (vl < 0.15))     # thin bars (any brightness) + dark bars
+
+# GLASS = window interior minus frame minus curtains — full coverage, no holes.
+glass_view = WIN_IN & (~FRAME) & (~CURT)
+glass_view = cv2.morphologyEx(glass_view.astype(np.float32), cv2.MORPH_OPEN,
+                              np.ones((3, 3), np.uint8))
+# EDGE-AWARE feather (guided filter): the boundary snaps to the real glass/frame/curtain
+# edge in the fused image; clamped so it can never leave the window masks.
+glass_view = _feather(glass_view, fused.astype(np.float32)/255)
+glass_view = glass_view * WIN.astype(np.float32)
+print(f"protected glass-only view = {(glass_view>0.5).mean()*100:.1f}%  (rest gets HDR)")
+
+# SHOW the VERIFIED segments — all in one colour-coded map (these are CELL 8's cleaned
+# masks, AFTER the see-through verification, not the raw CELL 5 detections):
+#   CYAN = glass/outdoor view · ORANGE = frame/mullions · MAGENTA = curtains/blinds
+seg_vis = fused.astype(np.float32)
+for msk, col in ((glass_view > 0.5, (220, 220, 0)),
+                 (FRAME, (0, 140, 255)),
+                 (CURT, (200, 0, 200))):
+    a = msk.astype(np.float32)[..., None] * 0.5
+    tint = np.zeros_like(seg_vis); tint[:] = col
+    seg_vis = seg_vis * (1 - a) + tint * a
+cv2.imwrite("segments_verified.jpg", seg_vis.clip(0, 255).astype("uint8"),
+            [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+# and the protect mask alone, for the final check:
+prot_vis = overlay(fused, glass_view > 0.5, (220, 220, 0))
+cv2.imwrite("protected_view.jpg", prot_vis, [cv2.IMWRITE_JPEG_QUALITY, 92])
+try:
+    from IPython.display import Image as _Img, display
+    print("VERIFIED segments — cyan glass · orange frame · magenta curtains:")
+    display(_Img("segments_verified.jpg"))
+    print("PROTECTED outdoor view (cyan) — HDR applies to everything else:")
+    display(_Img("protected_view.jpg"))
+except Exception:
+    pass
+
+# ---- enhance the whole (indoor) image; the view is excluded from the measurements ----
 img = fused.astype(np.float32)/255
-# interior finishing — window excluded from WB / levels measurement
-wex = cv2.GaussianBlur(cv2.dilate((seg_win > 0.3).astype(np.float32),
-                                  np.ones((k, k), np.uint8)), (0, 0), max(2.0, Wd*0.0015))
+ex = (glass_view > 0.3).astype(np.float32)
 boost = concept_masks.get("wall")
 protect = concept_masks.get("floor")
-img = _wb(img, exclude=wex)
-img = _levels(img, exclude=wex)
+img = _wb(img, exclude=ex)
+img = _levels(img, exclude=ex)
 img = _expose(img, 0.70)
 img = _neutralize(img, boost=None if boost is None else boost.astype(np.float32),
                   protect=None if protect is None else protect.astype(np.float32))
 img = _match_white(img)
 img = _scurve(img, 0.05)
+img = _sharpen(img)
 
-# WINDOW PULL — glass from the clearest bracket, frame from a lit bracket, single-source
-if have_win:
-    vi = _pick_view(res, seg_win); fi = _pick_frame(res, seg_win)
-    print(f"window: glass bracket #{vi}, frame bracket #{fi} of {len(res)}")
-    raw = res[vi].astype(np.float32)/255; frame_src = res[fi].astype(np.float32)/255
-    vlum = raw.mean(2); vchr = raw.max(2)-raw.min(2)
-    litw = np.maximum(np.clip((vlum-0.06)/0.10, 0, 1), np.clip((vchr-0.05)/0.08, 0, 1))
-    sel = (seg_win > 0.3) & (litw > 0.4)
-    med = float(np.median(vlum[sel])) if sel.any() else 0.0
-    view = raw if not (1e-3 < med < 0.58) else np.clip(raw, 0, 1)**float(np.clip(np.log(0.58)/np.log(med), 0.6, 1.0))
-    winb = (seg_win > 0.25).astype(np.float32)
-    winb = cv2.morphologyEx(winb, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
-    gm = _feather(winb*litw, raw)[..., None]
-    unit = frame_src*(1-gm) + view*gm
-    wm = np.clip(cv2.GaussianBlur(cv2.dilate(winb, np.ones((3, 3), np.uint8)),
-                                  (0, 0), max(2.0, Wd*0.0015)), 0, 1)[..., None]
-    img = img*(1-wm) + unit*wm
-
-# sharpen (clarity damped around the window so the boundary can't halo)
-band = None
-if have_win:
-    kk = max(3, int(Wd*0.01) | 1)
-    band = np.clip(cv2.GaussianBlur(cv2.dilate((seg_win > 0.2).astype(np.float32),
-                                               np.ones((kk, kk), np.uint8)), (0, 0), kk*0.5), 0, 1)
-img = _sharpen(img, protect=band)
+# ---- OUTDOOR VIEW = the image YOU uploaded in CELL 5 ----
+# NOT the Mertens blend (blown brighter brackets wash it out) and NOT enhanced — your
+# chosen image supplies the view content, gently lifted so it sits naturally next to
+# the enhanced room.
+print(f"outdoor view composited from {VIEW_DESC}")
+try:
+    from IPython.display import Image as _Img, display
+    print("THIS uploaded image is being blended into the glass:")
+    display(_Img("view_bracket.jpg"))
+except Exception:
+    pass
+vsrc = viewimg.astype(np.float32)/255
+vlum = vsrc.mean(2)
+sel = glass_view > 0.5
+med = float(np.median(vlum[sel])) if sel.any() else 0.0
+if 1e-3 < med < 0.58:                       # gentle lift only if the view sits dark
+    vsrc = np.clip(vsrc, 0, 1) ** float(np.clip(np.log(0.58)/np.log(med), 0.6, 1.0))
+gv = glass_view[..., None]
+img = img*(1-gv) + vsrc*gv
 
 result = (img*255).clip(0, 255).astype("uint8")
 cv2.imwrite("hdr_result.jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
 try:
     from IPython.display import Image as _Img, display
-    print("FINAL HDR:"); display(_Img("hdr_result.jpg"))
+    print("FUSED (base going in):"); display(_Img("fused.jpg"))
+    print(f"FINAL — indoor enhanced + crisp outdoor view from {VIEW_DESC}:")
+    display(_Img("hdr_result.jpg"))
 except Exception:
     pass
+files.download("fused.jpg")
+files.download("segments_verified.jpg")
+files.download("protected_view.jpg")
 files.download("hdr_result.jpg")
-print("done — final enhanced HDR with Grounded-SAM window pull")
+print("done — indoor (curtains + frame + room) enhanced; outdoor view from your image")
