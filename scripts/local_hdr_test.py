@@ -161,7 +161,33 @@ def _neutralize(img):
     # de-tinted, not flattened.
     shadow_wgt = np.clip((14-ch)/6, 0, 1) * np.clip((L-0.04)/0.05, 0, 1) * 0.5
     wgt = np.maximum(wgt, shadow_wgt)
+    # HALO-BAND FIX: tungsten shading on a white ceiling/wall sits at mid-luma
+    # (L 0.5-0.7) with chroma 14-24 — the GAP between the two terms above — so
+    # after the open ceiling is whitened, its shaded junction strip stays tan
+    # (measured: open ceiling b+2 vs band b+18 = the visible halo). Catch
+    # near-neutral pure-YELLOW pixels only: the a-channel gate spares green
+    # walls (a<=-5) and pink fabric / orange wood (a>=+4). Strength is
+    # a-dependent: full 0.9 on paint shading (a<=-1.5, which must end WHITE)
+    # but only 0.55 on warm-tan fabric (a>=+0.5, curtains stay beige).
+    ga = np.clip((a+5)/3, 0, 1) * np.clip((4-a)/4, 0, 1)
+    strength = 0.55 + 0.35*np.clip((0.5-a)/2, 0, 1)
+    yellow_wgt = (ga * np.clip((b-4)/6, 0, 1) * np.clip((28-ch)/8, 0, 1)
+                  * np.clip((L-0.45)/0.12, 0, 1) * strength)
+    # BULB-GLOW path (kitchen pendant): a warm bulb's glow on a white ceiling
+    # is slightly a-POSITIVE (a +1..+3), which the a-dependent strength above
+    # treats as fabric and barely touches (measured: glow ended b+10 vs
+    # AutoHDR b+1). Illumination cast is b-dominated with small a RELATIVE to
+    # its chroma — (ch-2a) sits at 7..11 for the glow but >=13 for real tan
+    # curtain folds — so that axis separates them where a and ch alone cannot.
+    sc = ch - 2*a
+    glow_wgt = (np.clip((6-a)/4, 0, 1) * np.clip((13.5-sc)/3.5, 0, 1)
+                * np.clip((b-4)/6, 0, 1) * np.clip((L-0.45)/0.12, 0, 1) * 0.9)
+    yellow_wgt = np.maximum(yellow_wgt, glow_wgt)
     wgt = cv2.GaussianBlur(wgt, (0, 0), 8)
+    # the band is a NARROW strip: the sigma-8 blur above would dilute its
+    # weight with the zero-weight green wall next to it (0.9 -> ~0.7 measured),
+    # so the yellow term gets its own tighter blur and joins afterwards.
+    wgt = np.maximum(wgt, cv2.GaussianBlur(yellow_wgt, (0, 0), 3))
     lab[..., 1] = a*(1-wgt)+128; lab[..., 2] = b*(1-wgt)+128
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
 
