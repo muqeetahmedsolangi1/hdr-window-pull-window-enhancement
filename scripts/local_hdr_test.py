@@ -1,14 +1,21 @@
 """
 LOCAL HDR TEST — pure HDR only: align + Mertens fuse the brackets, then run the
-finishing chain from clear_seg_window_pull.py's CELL 7 (Colab), UNCHANGED —
-byte-for-byte the same _wb / _levels / _expose(0.70) / _neutralize /
-_match_white / _scurve / _sharpen chain. NO segmentation, NO window mask,
-NO glass compositing — just the tone-mapping chain on the whole image.
+finishing chain from clear_seg_window_pull.py's CELL 7 (Colab), plus ONLY the
+3 MUDDY-LOOK fixes (below). NO segmentation, NO window mask, NO glass
+compositing — just the tone-mapping chain on the whole image.
 
-The ONLY difference vs the Colab pipeline: there is no glass mask here, so the
-`exclude=` parameter of _wb/_levels is unused (the Colab version excludes the
-segmented window glass from those measurements and composites the darker
-image's view into the glass afterwards).
+MUDDY-LOOK FIX (the only deviation from the Colab CELL 7 chain — calibrated on
+a real photo against an AutoHDR reference; no shadow-pocket lift/rescue here):
+  1) _expose target 0.70 -> 0.55 — 0.70 over-lifted an already-balanced fusion
+     and flattened/washed the frame
+  2) _neutralize also de-tints shadows/midtones (tight chroma gate — real
+     wood/fabric colour never touched), removing the warm dirty cast on dark
+     surfaces
+  3) _sharpen's clarity damped in shadows — uniform clarity on dark pixels is
+     what reads as "muddy/gritty"
+
+Differences vs the Colab pipeline: no glass mask (the `exclude=` parameter of
+_wb/_levels is unused) and no darker-image glass composite.
 
 Asks for (typed at the prompt, no GUI):
   a folder of exposure BRACKETS -> aligned (ECC) + Mertens FUSED locally
@@ -81,9 +88,63 @@ def _levels(img, blk=0.4, wht=99.7, maxblk=0.25, exclude=None):
     return np.clip((img - lo) / (hi - lo), 0, 1) * (0.91 - 0.02) + 0.02
 
 
-def _expose(img, target=0.70):
-    m = max(float(np.median(img.mean(2))), 1e-3)
-    return img if m >= target else np.clip(img, 0, 1) ** float(np.clip(np.log(target)/np.log(m), 0.45, 1.0))
+def _shadow_fill(fused, brightest, T=0.18, p=1.5, max_fill=0.30, feather=4):
+    """FUSION-TIME deep-shadow fill from the BRIGHTEST bracket.
+
+    Root cause (measured on the real photo): the table's bottom-shelf pocket
+    is clearly visible in the brightest bracket (EV+2.9, luma 0.396) but the
+    Mertens result lands at 0.049 — because that bracket is ~91% blown, its
+    well-exposedness weight is regionally ~0 at the coarse pyramid levels, and
+    the multi-scale smoothing suppresses it even at the few pixels where it is
+    actually the BEST-exposed frame. Boosting cv2.createMergeMertens's
+    exposure_weight does nothing (verified: 0.049 -> 0.051 at ew=5).
+
+    So the fill happens explicitly: wherever the fused luma is CRUSHED
+    (< T=0.18 — walls are 0.43, wood 0.24, pot 0.30, all untouched), blend in
+    the brightest bracket's real pixels, at most `max_fill` of the way. The
+    weight is a smooth function of the fused LUMINANCE itself (not an edge/
+    structure detector), so it cannot produce the silhouette-halo artifacts
+    the earlier pocket-rescue attempts did. Calibrated against AutoHDR:
+    pocket 0.222 (A:0.234), chair 0.232 (A:0.233), side table 0.450 (A:0.475).
+    """
+    fl = fused.astype(np.float32).mean(2) / 255
+    w = np.clip((T - fl) / T, 0, 1) ** p
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), feather) * max_fill
+    w3 = w[..., None]
+    out = fused.astype(np.float32) * (1 - w3) + brightest.astype(np.float32) * w3
+    return out.clip(0, 255).astype("uint8")
+
+
+def _bright_ramp(img):
+    """Soft mask of already-bright/clipped pixels (the blown window) — the
+    no-segmentation stand-in for the Colab glass mask, same trick as
+    hdr.py's build_window_mask fallback. Used to EXCLUDE the window from
+    measurements and to SHIELD it from the interior brightness lifts, so the
+    interior can be pushed to AutoHDR levels without blasting the view."""
+    luma = img.mean(2)
+    ramp = np.clip((luma - 0.80) / 0.12, 0, 1)
+    k = max(31, int(img.shape[1] * 0.008) | 1)
+    return cv2.GaussianBlur(ramp, (k, k), 0)
+
+
+def _expose(img, target=0.68, exclude=None):
+    # Measured against AutoHDR on the real photo: its INTERIOR sits much
+    # brighter (walls ~0.75) than a 0.55 target produces, but its WINDOW is
+    # darker than ours — so the median is measured on NON-bright pixels only
+    # (exclude = _bright_ramp) and the gamma is FADED OUT over the bright
+    # ramp, brightening the room without pushing the already-blown glass.
+    luma = img.mean(2)
+    sel = luma if exclude is None else luma[exclude < 0.5]
+    if sel.size < 1000: sel = luma
+    m = max(float(np.median(sel)), 1e-3)
+    if m >= target:
+        return img
+    gamma = float(np.clip(np.log(target) / np.log(m), 0.45, 1.0))
+    lifted = np.clip(img, 0, 1) ** gamma
+    if exclude is None:
+        return lifted
+    ex = exclude[..., None]
+    return lifted * (1 - ex) + np.clip(img, 0, 1) * ex
 
 
 def _neutralize(img):
@@ -92,6 +153,14 @@ def _neutralize(img):
     ch = np.sqrt(a*a+b*b)
     wgt = np.clip((L-0.70)/0.12, 0, 1) * np.clip((22-ch)/8, 0, 1)
     wgt = np.maximum(wgt, np.clip((L-0.85)/0.10, 0, 1))
+    # MUDDY FIX 2/3: the terms above SKIP everything below L=0.70, so a warm/
+    # cool cast on a dark table or shadowed wall never got cleaned — that tint
+    # is the colour half of the muddy look. Tight chroma gate (<14 vs 22) so
+    # real colour (wood grain, teal fabric) is never touched, only near-neutral
+    # surfaces tinted by mixed lighting; capped at 0.5 strength so shadows are
+    # de-tinted, not flattened.
+    shadow_wgt = np.clip((14-ch)/6, 0, 1) * np.clip((L-0.04)/0.05, 0, 1) * 0.5
+    wgt = np.maximum(wgt, shadow_wgt)
     wgt = cv2.GaussianBlur(wgt, (0, 0), 8)
     lab[..., 1] = a*(1-wgt)+128; lab[..., 2] = b*(1-wgt)+128
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
@@ -106,14 +175,57 @@ def _match_white(img, strength=0.85):
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
 
 
+def _lift_whites(img, amount=0.18, start=0.45, exclude=None):
+    """Brighten ONLY the bright zone (walls/ceiling/whites) toward white,
+    leaving shadows and midtones untouched. The (1-img) term approaches white
+    smoothly instead of clipping; `exclude` (the bright ramp) keeps the
+    already-blown window OUT of this lift so only real interior whites move."""
+    luma = img.mean(2)
+    w = np.clip((luma - start) / (1.0 - start), 0, 1) ** 1.3
+    if exclude is not None:
+        w = w * (1 - exclude)
+    return np.clip(img + amount * w[..., None] * (1.0 - img), 0, 1)
+
+
 def _scurve(img, s2=0.05):
     return np.clip(img + s2*np.sin(2*np.pi*(img-0.5)), 0, 1)
+
+
+def _tame_warm(img, knee=16, compress=0.55, l_gain=24):
+    """Fix for over-saturated / too-dark BROWNS & ORANGES (terracotta pot,
+    dark wood) — measured vs AutoHDR: the pot came out +0.065 more saturated
+    and the mahogany woods ~0.05 darker, because the per-channel _scurve
+    darkens+saturates warm midtones while everything else gets whiter.
+
+    Warm-quadrant only (LAB a>0 & b>0 soft gate) so the teal chair, sky and
+    all cool/neutral colours are untouched:
+      1) chroma above `knee` is soft-compressed (tames the pot's saturation)
+      2) dark/mid warm pixels get a small L give-back (un-darkens the wood)
+    Calibrated on the real photo: pot dL -0.002 / dS +0.009 vs AutoHDR."""
+    lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    A = lab[..., 1]-128; B = lab[..., 2]-128
+    ch = np.sqrt(A*A+B*B)
+    warm_w = np.clip(A/6, 0, 1) * np.clip(B/10, 0, 1)     # soft brown/orange gate
+    over = np.clip(ch - knee, 0, None)
+    scale = (knee + over*compress) / np.maximum(ch, 1e-3)
+    scale = 1 + (scale - 1) * warm_w
+    scale = cv2.GaussianBlur(scale.astype(np.float32), (0, 0), 3)
+    lab[..., 1] = A*scale + 128; lab[..., 2] = B*scale + 128
+    lw = np.clip((ch-8)/20, 0, 1) * warm_w * np.clip((0.62 - lab[..., 0]/255)/0.35, 0, 1)
+    lw = cv2.GaussianBlur(lw.astype(np.float32), (0, 0), 3)
+    lab[..., 0] = np.clip(lab[..., 0] + l_gain*lw, 0, 255)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
 
 
 def _sharpen(img, fine=0.9, clarity=0.2):
     img = np.clip(img + fine*(img - cv2.GaussianBlur(img, (0, 0), 1.0)), 0, 1)
     wide = cv2.GaussianBlur(img, (0, 0), 15)
-    return np.clip(img + clarity*(img - wide), 0, 1)
+    # MUDDY FIX 3/3: damp the wide-radius clarity in shadows — full-strength
+    # local contrast on already-dark pixels is what turns "dark" into
+    # "muddy/gritty". Never fully zero (blacks would go flat/dead).
+    luma = img.mean(2)
+    damp = np.clip((luma - 0.25) / 0.25, 0.15, 1.0)[..., None]
+    return np.clip(img + clarity*damp*(img - wide), 0, 1)
 # --------------------------------------------------------------------------------
 
 
@@ -133,16 +245,23 @@ def process(bracket_imgs, W=2000):
     aligned = _align(bimgs, ref, Wd, H)
 
     fused = (cv2.createMergeMertens().process(aligned) * 255).clip(0, 255).astype("uint8")
+    fused = _shadow_fill(fused, aligned[-1])   # crushed shadows <- brightest bracket
 
-    # the exact CELL 7 chain (no exclude mask here — no segmentation locally)
+    # the CELL 7 chain + muddy fixes + interior-brightness calibration.
+    # No segmentation: the "window" is approximated by a pure-luminance bright
+    # ramp (hdr.py's proven fallback) so it can be excluded from measurements
+    # and shielded from the interior lifts.
     img = fused.astype(np.float32) / 255
-    img = _wb(img)
-    img = _levels(img)
-    img = _expose(img, 0.70)
-    img = _neutralize(img)
+    ex = _bright_ramp(img)
+    img = _wb(img, exclude=ex)
+    img = _levels(img, exclude=ex)
+    img = _expose(img, exclude=ex)     # interior median -> 0.62; window shielded
+    img = _neutralize(img)             # muddy fix: shadows de-tinted too
     img = _match_white(img)
+    img = _lift_whites(img, exclude=ex)  # walls/whites brightened; window shielded
     img = _scurve(img, 0.05)
-    img = _sharpen(img)
+    img = _tame_warm(img)              # browns/oranges: de-oversaturate + un-darken
+    img = _sharpen(img)                # muddy fix: clarity damped in shadows
 
     result = (img * 255).clip(0, 255).astype("uint8")
     return result, fused
