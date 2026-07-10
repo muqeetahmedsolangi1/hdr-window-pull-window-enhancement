@@ -111,17 +111,37 @@ def detect(bgr, phrase, box_t=0.25, text_t=0.20):
     return d["boxes"].cpu().numpy()
 
 
-def seg_union(bgr, phrases):
-    """All phrases' boxes -> SAM 2.1 -> one union mask (native-res edges)."""
-    allb = [detect(bgr, p) for p in phrases]
-    allb = [b for b in allb if len(b)]
-    if not allb:
+def _iou(a, b):
+    x0 = max(a[0], b[0]); y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2]); y1 = min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    if inter <= 0:
+        return 0.0
+    ar_a = (a[2] - a[0]) * (a[3] - a[1])
+    ar_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / max(ar_a + ar_b - inter, 1e-6)
+
+
+def seg_union(bgr, phrases, max_boxes=24):
+    """ONE DINO pass for all phrasings (joined prompt) -> IoU-deduped boxes -> SAM.
+    Joining the synonyms into a single prompt replaces N model runs with one, and the
+    dedup removes the near-identical rectangles the synonyms produce — on big-window
+    scenes DINO boxes every pane AND the whole wall, and SAM's runtime scales with the
+    number of boxes, so this is a large speedup with identical output."""
+    boxes = detect(bgr, " . ".join(phrases))
+    if len(boxes) == 0:
         return np.zeros(bgr.shape[:2], bool)
-    boxes = np.vstack(allb)
+    keep = []
+    for b in boxes:
+        if all(_iou(b, k) < 0.75 for k in keep):
+            keep.append(b)
+        if len(keep) >= max_boxes:
+            break
+    print(f"    ({len(boxes)} boxes -> {len(keep)} after dedup)")
     try:
-        r = sam(bgr, bboxes=boxes.tolist(), retina_masks=True, verbose=False)
+        r = sam(bgr, bboxes=[list(map(float, b)) for b in keep], retina_masks=True, verbose=False)
     except TypeError:
-        r = sam(bgr, bboxes=boxes.tolist(), verbose=False)
+        r = sam(bgr, bboxes=[list(map(float, b)) for b in keep], verbose=False)
     if not r or r[0].masks is None:
         return np.zeros(bgr.shape[:2], bool)
     return r[0].masks.data.cpu().numpy().astype(bool).any(axis=0)
@@ -204,15 +224,23 @@ print("helpers ready")
 # ============================== CELL 5 — SEGMENT the 4 things (from FUSED) =====
 H, Wd = fused.shape[:2]
 
-# ---- VERIFICATION setup (light-through physics on the DARKEST bracket) ----
+# ---- VERIFICATION setup (light-through physics on a DARK reference bracket) ----
 # DINO's labels are proposals, NOT truth (it has called a ceiling fan and bed frames
 # "curtain", louvered closet doors "venetian blind" AND "window", a lamp "glass").
-# Physics decides: real GLASS shows the bright/colourful exterior in the darkest
-# bracket; fans, beds, closets, TVs and solid doors are DARK there.
-_dk = res[0].astype(np.float32) / 255
+# Physics decides: real GLASS shows the bright/colourful exterior in a dark bracket;
+# fans, beds, closets, TVs and solid doors are DARK there.
+#
+# The reference is the bracket whose mean sits near ~0.15 — dark enough that the indoor
+# is black, bright enough that the exterior actually READS. Using the absolute darkest
+# broke big-window scenes shot down to EV -7 (test-6): at mean ~4/255 even the exterior
+# is nearly black, every window failed the test and NOTHING got segmented.
+_means = [float(im.mean()) / 255 for im in res]
+_vref = int(np.argmin([abs(m - 0.15) for m in _means]))
+print(f"verification reference bracket = #{_vref} (mean {_means[_vref]*255:.0f}/255)  [darkest=#0]")
+_dk = res[_vref].astype(np.float32) / 255
 _dl = _dk.mean(2); _dc = _dk.max(2) - _dk.min(2)
-_thr = max(0.22, 0.45 * float(np.percentile(_dl, 99.9)))   # adapts to how dark the darkest is
-print(f"light-through threshold on darkest bracket = {_thr:.2f}")
+_thr = max(0.22, 0.45 * float(np.percentile(_dl, 99.9)))   # adapts to the reference
+print(f"light-through threshold on reference bracket = {_thr:.2f}")
 
 
 def verify(mask, mode, window_zone=None, min_area=0.0004):
@@ -251,27 +279,40 @@ CURTAIN_raw = seg_union(fused, ["curtain", "drape", "blind", "venetian blind"])
 CURTAIN = verify(CURTAIN_raw, "curtain", window_zone=_zone)
 print(f"curtains: proposed {CURTAIN_raw.mean()*100:5.1f}% -> verified {CURTAIN.mean()*100:5.1f}%")
 
-# 3) FRAME: thin achromatic bars INSIDE the window — geometry only (a wide OPEN erases
-#    thin bars, white or dark, but keeps big blobs so the view is never eaten)
+# 3) FRAME: mullions/bars INSIDE the window. THREE conditions, all physics/geometry:
+#    a) achromatic (white/grey painted bars, chroma < 0.07 in the fused image)
+#    b) NOT see-through — a frame is inside the room, it BLOCKS light, so in the dark
+#       reference bracket it stays dark. Blown-out sky / white pool deck / white boats
+#       are achromatic too, but they are BRIGHT in the dark bracket (SEE) — never frame.
+#       This is what kills the "frame eats the view" holes in the glass mask.
+#    c) LINE-shaped — bars survive a horizontal or vertical line opening; leftover
+#       irregular patches do not. Big blobs (a whole shaded wall) are subtracted.
 f = fused.astype(np.float32) / 255
 chroma = f.max(2) - f.min(2)
+SEE = (_dl >= _thr) | (_dc >= 0.15)               # see-through in the dark bracket
 lip = max(3, int(Wd * 0.004) | 1)
 WIN_IN = cv2.erode(WINDOW.astype(np.uint8), np.ones((lip, lip), np.uint8)).astype(bool)
-achro = (chroma < 0.07) & WIN_IN
-bar_k = max(5, int(Wd * 0.014) | 1)
+achro = (chroma < 0.07) & WIN_IN & (~SEE)
+bar_k = max(9, int(Wd * 0.025) | 1)
 blobs = cv2.morphologyEx(achro.astype(np.uint8), cv2.MORPH_OPEN,
                          np.ones((bar_k, bar_k), np.uint8)).astype(bool)
-FRAME = achro & ~blobs
+Lk = max(15, int(Wd * 0.03))
+line_h = cv2.morphologyEx(achro.astype(np.uint8), cv2.MORPH_OPEN,
+                          np.ones((1, Lk), np.uint8)).astype(bool)
+line_v = cv2.morphologyEx(achro.astype(np.uint8), cv2.MORPH_OPEN,
+                          np.ones((Lk, 1), np.uint8)).astype(bool)
+FRAME = (line_h | line_v) & ~blobs
 
 # 4) GLASS = window interior minus frame minus the OPAQUE part of the curtains.
 #    A blind/curtain is subtracted ONLY where it actually blocks the light — the
 #    see-through gaps between blind slats show the exterior in the darkest bracket,
 #    so they STAY glass. Without this, a window fully covered by venetian blinds
 #    loses its entire glass mask and the HDR cell has nothing to protect/composite.
-SEE = (_dl >= _thr) | (_dc >= 0.15)               # see-through in the darkest bracket
 CURTAIN_OPQ = CURTAIN & (~SEE)                    # opaque fabric / slats only
 GLASS = WIN_IN & ~FRAME & ~CURTAIN_OPQ
-GLASS = cv2.morphologyEx(GLASS.astype(np.uint8), cv2.MORPH_OPEN,
+GLASS = cv2.morphologyEx(GLASS.astype(np.uint8), cv2.MORPH_CLOSE,
+                         np.ones((5, 5), np.uint8))          # seal hairline seams
+GLASS = cv2.morphologyEx(GLASS, cv2.MORPH_OPEN,
                          np.ones((3, 3), np.uint8)).astype(bool)
 print(f"glass through curtain gaps kept: curtain {CURTAIN.mean()*100:.1f}% "
       f"-> opaque {CURTAIN_OPQ.mean()*100:.1f}%")
@@ -318,19 +359,39 @@ print("done — segments.zip has the 4 overlays + 4 binary masks + the combined 
 
 # ============================== CELL 6 — YOU upload the darker/view image ======
 # Upload the ONE image where the window background/view looks solid and good to YOUR
-# eye. It is resized + aligned to the fused image so it lines up exactly.
+# eye. SELF-CONTAINED: needs only `fused` from CELL 3 — it resizes the upload to the
+# fused image's exact size and ECC-aligns it against the fused image directly.
+from google.colab import files as _files
 print(">>> Upload YOUR darker / view image now:")
-vup = files.upload()
+vup = _files.upload()
+if not vup:
+    raise RuntimeError("no file uploaded — run this cell again and pick your view image")
 vpath = list(vup.keys())[0]
 viewimg = cv2.imread(vpath)
-vh, vw = viewimg.shape[:2]
-if vw != W:
-    viewimg = cv2.resize(viewimg, (W, int(vh * W / vw)), interpolation=cv2.INTER_AREA)
+if viewimg is None:
+    raise RuntimeError(f"could not read '{vpath}' — is it a JPG/PNG?")
+H2, W2 = fused.shape[:2]
+viewimg = cv2.resize(viewimg, (W2, H2), interpolation=cv2.INTER_AREA)  # exact same size
+
+# align to the FUSED image (inline ECC homography — exposure-robust)
 try:
-    viewimg = _ecc_align(viewimg, REF)
-    print(" * view image aligned to the brackets")
-except cv2.error:
-    print(" * WARNING: alignment failed — using the image as-is")
+    s = min(1.0, 1000 / W2)
+    g_r = cv2.equalizeHist(cv2.resize(cv2.cvtColor(fused, cv2.COLOR_BGR2GRAY), None,
+                                      fx=s, fy=s, interpolation=cv2.INTER_AREA))
+    g_m = cv2.equalizeHist(cv2.resize(cv2.cvtColor(viewimg, cv2.COLOR_BGR2GRAY), None,
+                                      fx=s, fy=s, interpolation=cv2.INTER_AREA))
+    warp = np.eye(3, dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5)
+    cv2.findTransformECC(g_r, g_m, warp, cv2.MOTION_HOMOGRAPHY, crit, None, 5)
+    S = np.diag([s, s, 1.0])
+    Hm = (np.linalg.inv(S) @ warp.astype(np.float64) @ S).astype(np.float32)
+    viewimg = cv2.warpPerspective(viewimg, Hm, (W2, H2),
+                                  flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                                  borderMode=cv2.BORDER_REPLICATE)
+    print(" * view image aligned to the fused image")
+except Exception as e:
+    print(f" * WARNING: alignment failed ({e}) — using the image as-is")
+
 VIEW_DESC = f"your image '{vpath}'"
 cv2.imwrite("view_image.jpg", viewimg, [cv2.IMWRITE_JPEG_QUALITY, 90])
 try:
@@ -358,22 +419,42 @@ see = (vl > 0.45) | (vc > 0.18)
 extra = zone & see & (~WINDOW) & (~CURTAIN_OPQ)
 extra = cv2.morphologyEx(extra.astype(np.uint8), cv2.MORPH_OPEN,
                          np.ones((5, 5), np.uint8)).astype(bool)
+# keep only pieces ATTACHED to a window — an open-door gap touches the glass panels,
+# while a LIT lampshade nearby is bright too but floats on its own -> dropped
+_wtouch = cv2.dilate(WINDOW.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+ncc2, lab2 = cv2.connectedComponents(extra.astype(np.uint8))
+_keep = np.zeros(extra.shape, bool)
+for i in range(1, ncc2):
+    comp = lab2 == i
+    if (comp & _wtouch).any():
+        _keep |= comp
+extra = _keep
 OPENING = cv2.morphologyEx((WINDOW | extra).astype(np.uint8), cv2.MORPH_CLOSE,
                            np.ones((max(3, int(Wd * 0.006) | 1),) * 2, np.uint8)).astype(bool)
 print(f"open-door view recovered: +{extra.mean()*100:.1f}% of image")
 
 # ---- WHAT to fill with your image -------------------------------------------------
+#  FILL_MODE = "glass":  only the see-through panes — the mullions/frame stay BRIGHT
+#              from the indoor HDR (pro look; in window mode they get painted dark
+#              from your view image). DEFAULT.
 #  FILL_MODE = "window": the FULL window unit (glass + blinds + inner frame) is taken
-#              from YOUR image — best when blinds/shades are INSIDE the window and your
-#              image shows the whole window well-exposed (this scene).
-#  FILL_MODE = "glass":  only the see-through glass — best when fabric curtains hang
-#              OVER the window and must stay bright (they'd go dark in window mode).
-FILL_MODE = "window"
+#              from YOUR image — use when blinds/shades are INSIDE the window and your
+#              image shows the whole window well-exposed (the test-9 bedroom case).
+FILL_MODE = "glass"
+
+# EXCLUDE_CURTAINS: keep the curtains on the HDR side — NEVER filled from your image.
+#  True  -> fabric drapes over the window stay bright/enhanced (this scene; without it
+#           the drapes were painted DARK from the view image).
+#  False -> curtains filled too (venetian blinds INSIDE the window, when your image
+#           shows the whole window well-exposed — the test-9 bedroom case).
+EXCLUDE_CURTAINS = True
 
 if FILL_MODE == "window":
     FILL = WINDOW | extra
 else:
     FILL = (GLASS | extra) & (~CURTAIN_OPQ)
+if EXCLUDE_CURTAINS:
+    FILL = FILL & (~CURTAIN)
 glass_soft = _feather(FILL.astype(np.float32), fused.astype(np.float32) / 255)
 glass_soft = glass_soft * OPENING.astype(np.float32)     # never outside the opening
 print(f"FILL_MODE={FILL_MODE}: protected = {(glass_soft > 0.5).mean()*100:.1f}% of image (rest gets HDR)")
