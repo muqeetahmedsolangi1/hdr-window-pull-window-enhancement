@@ -243,6 +243,28 @@ def _tame_warm(img, knee=16, compress=0.55, l_gain=24):
     return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
 
 
+def _desat_warm(img, lo=30, hi=115):
+    """CLIENT FIX (2026-07): desaturate the YELLOW and ORANGE hues across the
+    whole result — the client flagged the warm casts that survive fusion+HDR.
+
+    LAB hue-targeted chroma compression (like Lightroom's HSL yellow/orange
+    saturation sliders): hue window 30..115 deg with soft shoulders covers
+    red-orange -> yellow; the a-gate hard-protects green walls (a <= -6, sage
+    sits at hue ~120 right next to the window) and everything cool. Yellow
+    (hue > 70) is compressed harder (60%) than orange (40%) so wood keeps
+    some warmth while yellow casts/fabrics go towards neutral."""
+    lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    a = lab[..., 1]-128; b = lab[..., 2]-128
+    hue = np.degrees(np.arctan2(b, a))            # orange ~60, yellow ~90
+    w = np.clip((hue-lo)/18, 0, 1) * np.clip((hi-hue)/12, 0, 1)
+    w *= np.clip(b/6, 0, 1) * np.clip((a+6)/4, 0, 1)
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), 3)
+    amount = 0.4 + 0.2*np.clip((hue-70)/15, 0, 1)  # orange 0.4 -> yellow 0.6
+    f = 1 - amount*w
+    lab[..., 1] = a*f + 128; lab[..., 2] = b*f + 128
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)/255
+
+
 def _sharpen(img, fine=0.9, clarity=0.2):
     img = np.clip(img + fine*(img - cv2.GaussianBlur(img, (0, 0), 1.0)), 0, 1)
     wide = cv2.GaussianBlur(img, (0, 0), 15)
@@ -287,6 +309,7 @@ def process(bracket_imgs, W=2000):
     img = _lift_whites(img, exclude=ex)  # walls/whites brightened; window shielded
     img = _scurve(img, 0.05)
     img = _tame_warm(img)              # browns/oranges: de-oversaturate + un-darken
+    img = _desat_warm(img)             # CLIENT FIX: yellows/oranges desaturated
     img = _sharpen(img)                # muddy fix: clarity damped in shadows
 
     result = (img * 255).clip(0, 255).astype("uint8")
