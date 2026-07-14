@@ -1,5 +1,22 @@
 """
-CLEAR-SEG WINDOW PULL — segment on the CLEAR image, apply on the DARKER image.
+CLEAR-SEG WINDOW PULL + NEW HDR — segment on the CLEAR image, apply on the
+DARKER image. Exactly the same flow as "SAM + OneFormer Segmentation + Mask on
+Darkest Image + Window Fusion + HDR on Excluded Areas + Gemini HDR.py" — only
+CELL 7's HDR finishing is REPLACED with the full calibrated chain from
+scripts/local_hdr_test.py (the local app's HDR):
+
+  * _shadow_fill        fusion-time crushed-shadow fill from the brightest
+                        bracket (Mertens suppresses it — measured)
+  * _expose 0.68        interior median measured on NON-window pixels only,
+                        gamma faded out over the window (no washout)
+  * _neutralize         + shadow de-tint (muddy fix), + HALO-BAND fix (tan
+                        strip on whitened ceilings), + BULB-GLOW path
+                        (pendant glow, (ch-2a) axis)
+  * _lift_whites        walls/ceiling pushed to AutoHDR brightness, window out
+  * _tame_warm          browns/oranges: de-oversaturate + un-darken
+  * _desat_warm         CLIENT FIX: yellows (60%) / oranges (40%) desaturated,
+                        greens hard-protected
+  * _sharpen            wide clarity DAMPED in shadows (muddy fix)
 
 THE INSIGHT (user-found): SAM 3 / OneFormer are OBJECT models. On a dark bracket
 the window is barely an object — only the outdoor view glows. On a 0 EV / fused
@@ -15,8 +32,8 @@ Flow:
           physics gates fire NOW (see-through gate, curtain subtract, dark frame
           bars) -> final SAM 3 + OneFormer glass masks shown ON the darker image
   CELL 6  upload the exposure BRACKETS -> aligned -> Mertens FUSED
-  CELL 7  dropdown: 1 = SAM 3, 2 = OneFormer -> HDR everywhere EXCEPT the chosen
-          glass; the glass shows YOUR darker image, crisp. Downloads.
+  CELL 7  dropdown: 1 = SAM 3, 2 = OneFormer -> NEW HDR everywhere EXCEPT the
+          chosen glass; the glass shows YOUR darker image, crisp. Downloads.
   CELL 8  OPTIONAL: white window frames via Gemini Nano Banana Pro with the hard
           anti-hallucination composite (only frame-band pixels from Gemini).
 
@@ -344,9 +361,14 @@ except Exception:
     pass
 
 
-# ============================== CELL 7 — PICK a segmentation, then HDR ========
+# ============================== CELL 7 — PICK a segmentation, then NEW HDR ====
 # Compact side-by-side of the two FINAL masks; pick via the dropdown (form field
 # on the right of this cell in Colab) — input() boxes are unreliable there.
+# The HDR here is the FULL calibrated chain from scripts/local_hdr_test.py.
+_need = [n for n in ("fused", "darkimg", "aligned", "GLASS") if n not in globals()]
+if _need:
+    raise RuntimeError(f"missing {_need} — run CELLS 2-6 first")
+
 _tiles = []
 for _fn in ("glass_sam3.jpg", "glass_oneformer.jpg"):
     _t = cv2.imread(_fn)
@@ -497,7 +519,8 @@ def _lift_whites(img, amount=0.18, start=0.45, exclude=None):
     return np.clip(img + amount * w[..., None] * (1.0 - img), 0, 1)
 
 
-def _scurve(img, s2=0.05): return np.clip(img + s2*np.sin(2*np.pi*(img-0.5)), 0, 1)
+def _scurve(img, s2=0.05):
+    return np.clip(img + s2*np.sin(2*np.pi*(img-0.5)), 0, 1)
 
 
 def _tame_warm(img, knee=16, compress=0.55, l_gain=24):
@@ -549,7 +572,7 @@ def _sharpen(img, fine=0.9, clarity=0.2):
 # fusion-time crushed-shadow fill (brightest aligned bracket = aligned[-1])
 fused_sf = _shadow_fill(fused, aligned[-1])
 
-img = fused_sf.astype(np.float32)/255
+img = fused_sf.astype(np.float32) / 255
 # exclude = the REAL glass mask + any other blown/bright areas (lights, extra
 # windows the mask missed) — same role as the local app's bright ramp
 ex = np.maximum(glass_view, _bright_ramp(img))
@@ -578,14 +601,14 @@ cv2.imwrite("hdr_result.jpg", result, [cv2.IMWRITE_JPEG_QUALITY, 95])
 cv2.imwrite("glass_mask_chosen.png", ((glass_view > 0.5).astype(np.uint8) * 255))
 try:
     from IPython.display import Image as _Img, display
-    print(f"FINAL — HDR everywhere except the {key.upper()} glass (view from your darker image):")
+    print(f"FINAL — NEW HDR everywhere except the {key.upper()} glass (view from your darker image):")
     display(_Img("hdr_result.jpg"))
 except Exception:
     pass
 files.download("fused.jpg")
 files.download("glass_mask_chosen.png")
 files.download("hdr_result.jpg")
-print(f"done — segmented on the CLEAR image, view from the DARKER image ({key.upper()})")
+print(f"done — segmented on the CLEAR image, view from the DARKER image ({key.upper()}), NEW HDR chain")
 
 
 # ============================== CELL 8 — OPTIONAL: WHITE FRAMES via Gemini ====
