@@ -244,20 +244,29 @@ def _tame_warm(img, knee=16, compress=0.55, l_gain=24):
 
 
 def _desat_warm(img, lo=30, hi=115):
-    """CLIENT FIX (2026-07): desaturate the YELLOW and ORANGE hues across the
-    whole result — the client flagged the warm casts that survive fusion+HDR.
+    """CLIENT FIX v2: desaturate the YELLOW and ORANGE casts but PROTECT
+    strong, intentional yellows (client: v1 made yellow saturation too low).
 
     LAB hue-targeted chroma compression (like Lightroom's HSL yellow/orange
     saturation sliders): hue window 30..115 deg with soft shoulders covers
     red-orange -> yellow; the a-gate hard-protects green walls (a <= -6, sage
     sits at hue ~120 right next to the window) and everything cool. Yellow
-    (hue > 70) is compressed harder (60%) than orange (40%) so wood keeps
-    some warmth while yellow casts/fabrics go towards neutral."""
+    (hue > 70) is compressed harder (60%) than orange (40%).
+
+    v2 chroma rolloff: weak yellows (chroma <= 14 — light casts on ceilings/
+    walls/pale fabrics) are desaturated exactly as v1; strongly saturated
+    yellow objects (decor, flowers, rich wood, chroma >= 26) keep 75% of
+    their saturation — protection fades in between."""
     lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
     a = lab[..., 1]-128; b = lab[..., 2]-128
+    ch = np.sqrt(a*a + b*b)
     hue = np.degrees(np.arctan2(b, a))            # orange ~60, yellow ~90
     w = np.clip((hue-lo)/18, 0, 1) * np.clip((hi-hue)/12, 0, 1)
     w *= np.clip(b/6, 0, 1) * np.clip((a+6)/4, 0, 1)
+    # chroma rolloff: weak casts (ch<=14) keep FULL desaturation, strong real
+    # colour (ch>=26) keeps only 25% of it
+    keep = np.clip((ch - 14) / 12, 0, 1)          # 0 = cast, 1 = real colour
+    w *= 1 - 0.75*keep
     w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), 3)
     amount = 0.4 + 0.2*np.clip((hue-70)/15, 0, 1)  # orange 0.4 -> yellow 0.6
     f = 1 - amount*w

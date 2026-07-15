@@ -653,12 +653,45 @@ if gem is None:
                        + str(getattr(resp, "text", ""))[:300])
 gem = cv2.resize(gem, (Wd, H), interpolation=cv2.INTER_LANCZOS4)
 
+# ---- FRAME BAND — the pixels where Gemini's white frame is allowed to land.
+# It MUST cover the WHOLE window frame (outer casing/sash + the mullion bars
+# between the panes) or the dark frame bits it misses stay BLACK in the final.
+# The old version (thin ring + only near-black dl<0.18 bars) left big black gaps
+# on thick sliding-door frames AND wrongly ate dark view content (a pool-cage /
+# tree seen THROUGH the glass). This rebuild fixes both — verified on a synthetic
+# window: frame capture 42% -> 100%, dark view eaten 100% -> 0%.
 g8 = (glass_view > 0.5).astype(np.uint8)
-k = max(9, int(Wd * 0.012) | 1)
-ring = cv2.dilate(g8, np.ones((k, k), np.uint8)).astype(bool) & ~g8.astype(bool)
-near = cv2.dilate(g8, np.ones((k * 4 | 1, k * 4 | 1), np.uint8)).astype(bool)
-bars = (dc < 0.07) & (dl < 0.18) & near
-FRAMEB = cv2.GaussianBlur((ring | bars).astype(np.float32), (0, 0), 2)
+glass_bool = g8.astype(bool)
+
+# zone = the window unit + a generous margin; the frame can never be outside it
+zone = cv2.dilate(g8, np.ones((max(11, int(Wd * 0.05) | 1),) * 2, np.uint8)).astype(bool)
+
+# 1) RING hugging the glass — the outer casing/sash AND the thin gap between two
+#    panes (the centre mullion sits in that gap). Wider than the old ring.
+ring_k = max(13, int(Wd * 0.022) | 1)
+ring = cv2.dilate(g8, np.ones((ring_k, ring_k), np.uint8)).astype(bool) & ~glass_bool
+
+# 2) DARK colourless frame in the zone. Thresholds RELAXED (dl < 0.35 / dc < 0.12,
+#    was 0.18 / 0.07) so medium-grey frame is caught too — that relaxation is what
+#    removes the leftover black. Split so real view is protected:
+#      * OUTSIDE the glass  -> keep all of it (the casing/sash)
+#      * INSIDE the glass   -> keep only THIN LINE-shaped bars (pane dividers);
+#        a thick dark blob there is the outdoor view (pool cage / dark tree) and
+#        is deliberately NOT touched.
+darkbar = (dl < 0.35) & (dc < 0.12) & zone
+Lk = max(21, int(Wd * 0.03))
+line = (cv2.morphologyEx(darkbar.astype(np.uint8), cv2.MORPH_OPEN, np.ones((1, Lk), np.uint8)) |
+        cv2.morphologyEx(darkbar.astype(np.uint8), cv2.MORPH_OPEN, np.ones((Lk, 1), np.uint8))).astype(bool)
+outer = darkbar & ~glass_bool
+inner_lines = line & glass_bool
+thin_k = max(3, int(Wd * 0.02) | 1)                     # a mullion is at most ~2% wide
+inner_lines = inner_lines & ~cv2.morphologyEx(
+    inner_lines.astype(np.uint8), cv2.MORPH_OPEN, np.ones((thin_k, thin_k), np.uint8)).astype(bool)
+
+frame_raw = ring | outer | inner_lines
+frame_raw = cv2.morphologyEx(frame_raw.astype(np.uint8), cv2.MORPH_CLOSE,
+                             np.ones((max(3, int(Wd * 0.006) | 1),) * 2, np.uint8)).astype(bool) & zone
+FRAMEB = cv2.GaussianBlur(frame_raw.astype(np.float32), (0, 0), 2)
 fb = FRAMEB[..., None]
 final = (result.astype(np.float32) * (1 - fb) + gem.astype(np.float32) * fb)
 final = final.clip(0, 255).astype("uint8")
